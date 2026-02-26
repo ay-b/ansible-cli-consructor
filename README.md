@@ -38,13 +38,13 @@ An interactive terminal UI for building `ansible-playbook` commands. Discovers p
 ## Installation
 
 ```bash
-go install github.com/YOUR_USERNAME/cli-constructor@latest
+go install github.com/ay-b/cli-constructor@latest
 ```
 
 Or build from source:
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/cli-constructor.git
+git clone https://github.com/ay-b/cli-constructor.git
 cd cli-constructor
 go build -o cli-constructor .
 ```

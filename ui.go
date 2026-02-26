@@ -129,11 +129,15 @@ func updateTitles(g *gocui.Gui, state *AppState) {
 		}
 	}
 	if v, err := g.View(viewCommand); err == nil {
+		notify := ""
+		if state.Notification != "" {
+			notify = fmt.Sprintf(" ~ %s ~", state.Notification)
+		}
 		if state.ActivePane == PaneCommand {
-			v.Title = " Command [Enter/C: copy] [*] "
+			v.Title = fmt.Sprintf(" Command [Enter/C: copy]%s [*] ", notify)
 			v.FrameColor = gocui.ColorGreen
 		} else {
-			v.Title = " Command [Enter/C: copy] "
+			v.Title = fmt.Sprintf(" Command [Enter/C: copy]%s ", notify)
 			v.FrameColor = gocui.ColorDefault
 		}
 	}
@@ -163,6 +167,42 @@ func renderPlaybooks(g *gocui.Gui, state *AppState) {
 	_ = v.SetCursor(0, cursor)
 }
 
+// varSectionCount returns the number of section headers that would be
+// rendered for a playbook's variable list (one per distinct Source group).
+func varSectionCount(pb *Playbook) int {
+	if len(pb.Variables) == 0 {
+		return 0
+	}
+	count := 1
+	for i := 1; i < len(pb.Variables); i++ {
+		if pb.Variables[i].Source != pb.Variables[i-1].Source {
+			count++
+		}
+	}
+	return count
+}
+
+// varIndexToDisplayRow maps a variable index to its display row,
+// accounting for section header lines that precede it.
+func varIndexToDisplayRow(pb *Playbook, varIdx int) int {
+	row := 1 // first section header
+	for i := 1; i <= varIdx; i++ {
+		row++ // previous variable
+		if pb.Variables[i].Source != pb.Variables[i-1].Source {
+			row++ // section header before this variable
+		}
+	}
+	return row
+}
+
+// sectionLabel returns the display label for a variable source.
+func sectionLabel(source string) string {
+	if source == "playbook" {
+		return "playbook vars"
+	}
+	return "Role: " + source
+}
+
 // renderVariables draws the variable list for the selected playbook.
 func renderVariables(g *gocui.Gui, state *AppState) {
 	v, err := g.View(viewVariables)
@@ -182,9 +222,10 @@ func renderVariables(g *gocui.Gui, state *AppState) {
 		viewH = 1
 	}
 
-	// Vim-style centered scrolling
-	origin, _ := centeredScroll(state.SelectedVar, len(pb.Variables), viewH)
-	state.VarScrollOffset = origin
+	totalRows := len(pb.Variables) + varSectionCount(pb)
+	selectedRow := varIndexToDisplayRow(pb, state.SelectedVar)
+	origin, _ := centeredScroll(selectedRow, totalRows, viewH)
+
 	nameW := 30
 	valW := 25
 	if viewW > 100 {
@@ -192,36 +233,64 @@ func renderVariables(g *gocui.Gui, state *AppState) {
 		valW = 30
 	}
 
-	for i := state.VarScrollOffset; i < len(pb.Variables) && i < state.VarScrollOffset+viewH; i++ {
+	// Build display rows and render the visible window
+	displayRow := 0
+	rendered := 0
+	prevSource := ""
+	for i := 0; i < len(pb.Variables) && rendered < viewH; i++ {
 		vr := pb.Variables[i]
-		cursor := "  "
-		if i == state.SelectedVar && state.ActivePane == PaneVariables {
-			cursor = "> "
-		}
 
-		displayVal := vr.Default
-		if vr.UserValue != "" {
-			displayVal = vr.UserValue
-		}
-
-		// Truncate fields
-		name := truncate(vr.Name, nameW)
-		val := truncate(displayVal, valW)
-		desc := ""
-		if vr.Description != "" {
-			remaining := viewW - nameW - valW - 8 // cursor + separators
-			if remaining > 5 {
-				desc = truncate(vr.Description, remaining)
+		// Section header when source changes
+		if vr.Source != prevSource {
+			if displayRow >= origin && rendered < viewH {
+				label := sectionLabel(vr.Source)
+				pad := viewW - len(label) - 6 // "  ── " + " ──"
+				if pad < 0 {
+					pad = 0
+				}
+				fmt.Fprintf(v, "  \033[36m── %s %s\033[0m\n", label, strings.Repeat("─", pad))
+				rendered++
 			}
+			displayRow++
+			prevSource = vr.Source
 		}
 
-		if vr.IsComplex {
-			fmt.Fprintf(v, "%s\033[90m%-*s  %-*s  %s\033[0m\n", cursor, nameW, name, valW, val, desc)
-		} else if vr.UserValue != "" {
-			fmt.Fprintf(v, "%s\033[33m%-*s\033[0m  \033[32m%-*s\033[0m  \033[90m%s\033[0m\n", cursor, nameW, name, valW, val, desc)
-		} else {
-			fmt.Fprintf(v, "%s%-*s  \033[90m%-*s\033[0m  \033[90m%s\033[0m\n", cursor, nameW, name, valW, val, desc)
+		if rendered >= viewH {
+			break
 		}
+
+		// Variable row
+		if displayRow >= origin {
+			cursor := "  "
+			if i == state.SelectedVar && state.ActivePane == PaneVariables {
+				cursor = "> "
+			}
+
+			displayVal := vr.Default
+			if vr.UserValue != "" {
+				displayVal = vr.UserValue
+			}
+
+			name := truncate(vr.Name, nameW)
+			val := truncate(displayVal, valW)
+			desc := ""
+			if vr.Description != "" {
+				remaining := viewW - nameW - valW - 8
+				if remaining > 5 {
+					desc = truncate(vr.Description, remaining)
+				}
+			}
+
+			if vr.IsComplex {
+				fmt.Fprintf(v, "%s\033[90m%-*s  %-*s  %s\033[0m\n", cursor, nameW, name, valW, val, desc)
+			} else if vr.UserValue != "" {
+				fmt.Fprintf(v, "%s\033[33m%-*s\033[0m  \033[32m%-*s\033[0m  \033[90m%s\033[0m\n", cursor, nameW, name, valW, val, desc)
+			} else {
+				fmt.Fprintf(v, "%s%-*s  \033[90m%-*s\033[0m  \033[90m%s\033[0m\n", cursor, nameW, name, valW, val, desc)
+			}
+			rendered++
+		}
+		displayRow++
 	}
 }
 
@@ -239,11 +308,7 @@ func renderCommand(g *gocui.Gui, state *AppState) {
 	}
 
 	cmd := generateCommand(pb)
-	if state.Notification != "" {
-		fmt.Fprintf(v, "%s\n\n  \033[32m%s\033[0m", cmd, state.Notification)
-	} else {
-		fmt.Fprint(v, cmd)
-	}
+	fmt.Fprint(v, cmd)
 }
 
 // generateCommand builds the ansible-playbook command string.
@@ -789,7 +854,7 @@ func openHelp(g *gocui.Gui, state *AppState) func(*gocui.Gui, *gocui.View) error
 	return func(gui *gocui.Gui, v *gocui.View) error {
 		maxX, maxY := gui.Size()
 		w := 56
-		h := 26
+		h := 31
 		if w > maxX-4 {
 			w = maxX - 4
 		}
@@ -810,6 +875,11 @@ func openHelp(g *gocui.Gui, state *AppState) func(*gocui.Gui, *gocui.View) error
 		hv.Clear()
 
 		help := `
+ ┌──────────────────────────────────────────────────┐
+ │ Ansible command constructor                      │
+ │ https://github.com/ay-b/ansible-cli-consructor   │
+ └──────────────────────────────────────────────────┘
+
  GLOBAL
    Tab          Cycle panes (playbooks/vars/cmd)
    Ctrl+C       Quit
