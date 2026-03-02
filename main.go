@@ -50,7 +50,7 @@ func main() {
 
 	var playbooks []Playbook
 	for _, p := range paths {
-		roles, pbVars, err := ParsePlaybook(p)
+		roles, roleTags, pbVars, err := ParsePlaybook(p)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: skipping %s: %v\n", p, err)
 			continue
@@ -75,6 +75,7 @@ func main() {
 			Name:      name,
 			Path:      p,
 			Roles:     roles,
+			RoleTags:  roleTags,
 			Variables: variables,
 		})
 	}
@@ -85,8 +86,9 @@ func main() {
 	}
 
 	state := &AppState{
-		Playbooks:  playbooks,
-		ActivePane: PanePlaybooks,
+		Playbooks:    playbooks,
+		ActivePane:   PanePlaybooks,
+		SelectedTags: make(map[string]bool),
 	}
 
 	if err := RunUI(state); err != nil {

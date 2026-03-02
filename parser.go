@@ -24,25 +24,31 @@ func DiscoverPlaybooks(playbooksDir string) ([]string, error) {
 	return paths, nil
 }
 
-// ParsePlaybook reads a playbook YAML file and extracts roles and playbook-level variables.
-func ParsePlaybook(path string) (roles []string, vars []Variable, err error) {
+// RoleEntry holds a parsed role name and its associated tags.
+type RoleEntry struct {
+	Name string
+	Tags []string
+}
+
+// ParsePlaybook reads a playbook YAML file and extracts roles, role tags, and playbook-level variables.
+func ParsePlaybook(path string) (roles []string, roleTags map[string][]string, vars []Variable, err error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, nil, fmt.Errorf("read %s: %w", path, err)
+		return nil, nil, nil, fmt.Errorf("read %s: %w", path, err)
 	}
 
 	var doc yaml.Node
 	if err := yaml.Unmarshal(data, &doc); err != nil {
-		return nil, nil, fmt.Errorf("parse %s: %w", path, err)
+		return nil, nil, nil, fmt.Errorf("parse %s: %w", path, err)
 	}
 
 	if doc.Kind != yaml.DocumentNode || len(doc.Content) == 0 {
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 
 	root := doc.Content[0]
 	if root.Kind != yaml.SequenceNode {
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 
 	seenRoles := make(map[string]bool)
@@ -70,11 +76,23 @@ func ParsePlaybook(path string) (roles []string, vars []Variable, err error) {
 				}
 
 			case "roles":
-				names := extractRoleNamesFromRolesSection(valNode)
-				for _, name := range names {
-					if !seenRoles[name] {
-						seenRoles[name] = true
-						roles = append(roles, name)
+				entries := extractRolesFromRolesSection(valNode)
+				for _, entry := range entries {
+					if !seenRoles[entry.Name] {
+						seenRoles[entry.Name] = true
+						roles = append(roles, entry.Name)
+					}
+					if len(entry.Tags) > 0 {
+						if roleTags == nil {
+							roleTags = make(map[string][]string)
+						}
+						existing := roleTags[entry.Name]
+						for _, t := range entry.Tags {
+							if !containsStr(existing, t) {
+								existing = append(existing, t)
+							}
+						}
+						roleTags[entry.Name] = existing
 					}
 				}
 
@@ -90,7 +108,7 @@ func ParsePlaybook(path string) (roles []string, vars []Variable, err error) {
 		}
 	}
 
-	return roles, vars, nil
+	return roles, roleTags, vars, nil
 }
 
 // ParseRoleDefaults reads a role's defaults/main.yml and extracts variables.
@@ -203,31 +221,72 @@ func extractDefaultValue(node *yaml.Node) (string, bool) {
 	}
 }
 
-// extractRoleNamesFromRolesSection extracts role names from a `roles:` sequence node.
-func extractRoleNamesFromRolesSection(node *yaml.Node) []string {
+// extractRolesFromRolesSection extracts role names and tags from a `roles:` sequence node.
+func extractRolesFromRolesSection(node *yaml.Node) []RoleEntry {
 	node = resolveAlias(node)
 	if node.Kind != yaml.SequenceNode {
 		return nil
 	}
 
-	var names []string
+	var entries []RoleEntry
 	for _, item := range node.Content {
 		item = resolveAlias(item)
 		switch item.Kind {
 		case yaml.ScalarNode:
 			// Bare role name: `- first_run_init`
-			names = append(names, item.Value)
+			entries = append(entries, RoleEntry{Name: item.Value})
 		case yaml.MappingNode:
-			// Role object: `- role: deploy_longhorn` or `- { role: deploy_longhorn, tags: [...] }`
+			// Role object: `- { role: deploy_longhorn, tags: [storage, longhorn] }`
+			var name string
+			var tags []string
 			for j := 0; j < len(item.Content)-1; j += 2 {
-				if item.Content[j].Value == "role" {
-					names = append(names, resolveAlias(item.Content[j+1]).Value)
-					break
+				key := item.Content[j].Value
+				val := resolveAlias(item.Content[j+1])
+				switch key {
+				case "role":
+					name = val.Value
+				case "tags":
+					tags = extractTagsList(val)
 				}
+			}
+			if name != "" {
+				entries = append(entries, RoleEntry{Name: name, Tags: tags})
 			}
 		}
 	}
-	return names
+	return entries
+}
+
+// extractTagsList extracts tag strings from a tags value node.
+// Handles both scalar (single tag) and sequence (list of tags).
+func extractTagsList(node *yaml.Node) []string {
+	node = resolveAlias(node)
+	switch node.Kind {
+	case yaml.ScalarNode:
+		if node.Value != "" {
+			return []string{node.Value}
+		}
+	case yaml.SequenceNode:
+		var tags []string
+		for _, item := range node.Content {
+			item = resolveAlias(item)
+			if item.Kind == yaml.ScalarNode && item.Value != "" {
+				tags = append(tags, item.Value)
+			}
+		}
+		return tags
+	}
+	return nil
+}
+
+// containsStr checks if a string slice contains a given string.
+func containsStr(slice []string, s string) bool {
+	for _, item := range slice {
+		if item == s {
+			return true
+		}
+	}
+	return false
 }
 
 // extractRoleNamesFromTasks scans a tasks sequence for include_role/import_role references.

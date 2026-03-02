@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -12,11 +13,13 @@ import (
 
 const (
 	viewPlaybooks = "playbooks"
+	viewTags      = "tags"
 	viewVariables = "variables"
 	viewCommand   = "command"
 	viewEditor    = "editor"
 	viewSearch    = "search"
 	viewHelp      = "help"
+	viewTagPopup  = "tagpopup"
 )
 
 // RunUI starts the gocui main loop.
@@ -59,6 +62,9 @@ func layout(g *gocui.Gui, state *AppState) error {
 		cmdY = 3
 	}
 
+	// Tags pane height: frame top + 1 content line + frame bottom = 3 rows
+	tagsY1 := 2
+
 	// Left pane: Playbooks
 	if v, err := g.SetView(viewPlaybooks, 0, 0, splitX-1, cmdY-1, 0); err != nil {
 		if !errors.Is(err, gocui.ErrUnknownView) {
@@ -73,8 +79,17 @@ func layout(g *gocui.Gui, state *AppState) error {
 		}
 	}
 
-	// Right pane: Variables
-	if v, err := g.SetView(viewVariables, splitX, 0, maxX-1, cmdY-1, 0); err != nil {
+	// Right top pane: Tags
+	if v, err := g.SetView(viewTags, splitX, 0, maxX-1, tagsY1, 0); err != nil {
+		if !errors.Is(err, gocui.ErrUnknownView) {
+			return err
+		}
+		v.Frame = true
+		v.Wrap = false
+	}
+
+	// Right bottom pane: Variables
+	if v, err := g.SetView(viewVariables, splitX, tagsY1+1, maxX-1, cmdY-1, 0); err != nil {
 		if !errors.Is(err, gocui.ErrUnknownView) {
 			return err
 		}
@@ -92,6 +107,7 @@ func layout(g *gocui.Gui, state *AppState) error {
 	}
 
 	renderPlaybooks(g, state)
+	renderTags(g, state)
 	renderVariables(g, state)
 	renderCommand(g, state)
 	updateTitles(g, state)
@@ -110,15 +126,33 @@ func updateTitles(g *gocui.Gui, state *AppState) {
 			v.FrameColor = gocui.ColorDefault
 		}
 	}
+	if v, err := g.View(viewTags); err == nil {
+		pb := state.currentPlaybook()
+		tagCount := 0
+		if pb != nil {
+			tagCount = len(pb.AllTags())
+		}
+		selectedCount := 0
+		for _, sel := range state.SelectedTags {
+			if sel {
+				selectedCount++
+			}
+		}
+		if state.ActivePane == PaneTags {
+			v.Title = fmt.Sprintf(" Tags (%d/%d) [*] ", selectedCount, tagCount)
+			v.FrameColor = gocui.ColorGreen
+		} else {
+			v.Title = fmt.Sprintf(" Tags (%d/%d) ", selectedCount, tagCount)
+			v.FrameColor = gocui.ColorDefault
+		}
+	}
 	if v, err := g.View(viewVariables); err == nil {
+		vars := state.FilteredVariables()
+		varCount := len(vars)
 		pb := state.currentPlaybook()
 		roleInfo := ""
 		if pb != nil && len(pb.Roles) > 0 {
 			roleInfo = fmt.Sprintf(" | %d roles", len(pb.Roles))
-		}
-		varCount := 0
-		if pb != nil {
-			varCount = len(pb.Variables)
 		}
 		if state.ActivePane == PaneVariables {
 			v.Title = fmt.Sprintf(" Variables (%d)%s [*] ", varCount, roleInfo)
@@ -167,15 +201,47 @@ func renderPlaybooks(g *gocui.Gui, state *AppState) {
 	_ = v.SetCursor(0, cursor)
 }
 
+// renderTags draws the tags summary line in the tags pane.
+func renderTags(g *gocui.Gui, state *AppState) {
+	v, err := g.View(viewTags)
+	if err != nil {
+		return
+	}
+	v.Clear()
+
+	pb := state.currentPlaybook()
+	if pb == nil || len(pb.AllTags()) == 0 {
+		fmt.Fprint(v, "  selected tags: (none available)")
+		return
+	}
+
+	// Collect selected tags in sorted order
+	var selected []string
+	allTags := pb.AllTags()
+	for _, t := range allTags {
+		if state.SelectedTags[t] {
+			selected = append(selected, t)
+		}
+	}
+
+	if len(selected) == 0 {
+		fmt.Fprint(v, "  selected tags: none")
+	} else {
+		line := "  selected tags: " + strings.Join(selected, ", ")
+		viewW, _ := v.Size()
+		fmt.Fprint(v, truncate(line, viewW))
+	}
+}
+
 // varSectionCount returns the number of section headers that would be
-// rendered for a playbook's variable list (one per distinct Source group).
-func varSectionCount(pb *Playbook) int {
-	if len(pb.Variables) == 0 {
+// rendered for a variable list (one per distinct Source group).
+func varSectionCount(vars []Variable) int {
+	if len(vars) == 0 {
 		return 0
 	}
 	count := 1
-	for i := 1; i < len(pb.Variables); i++ {
-		if pb.Variables[i].Source != pb.Variables[i-1].Source {
+	for i := 1; i < len(vars); i++ {
+		if vars[i].Source != vars[i-1].Source {
 			count++
 		}
 	}
@@ -184,11 +250,11 @@ func varSectionCount(pb *Playbook) int {
 
 // varIndexToDisplayRow maps a variable index to its display row,
 // accounting for section header lines that precede it.
-func varIndexToDisplayRow(pb *Playbook, varIdx int) int {
+func varIndexToDisplayRow(vars []Variable, varIdx int) int {
 	row := 1 // first section header
 	for i := 1; i <= varIdx; i++ {
 		row++ // previous variable
-		if pb.Variables[i].Source != pb.Variables[i-1].Source {
+		if vars[i].Source != vars[i-1].Source {
 			row++ // section header before this variable
 		}
 	}
@@ -211,9 +277,13 @@ func renderVariables(g *gocui.Gui, state *AppState) {
 	}
 	v.Clear()
 
-	pb := state.currentPlaybook()
-	if pb == nil || len(pb.Variables) == 0 {
-		fmt.Fprintln(v, "  (no variables)")
+	vars := state.FilteredVariables()
+	if len(vars) == 0 {
+		if len(state.SelectedTags) > 0 {
+			fmt.Fprintln(v, "  (no variables match selected tags)")
+		} else {
+			fmt.Fprintln(v, "  (no variables)")
+		}
 		return
 	}
 
@@ -222,8 +292,8 @@ func renderVariables(g *gocui.Gui, state *AppState) {
 		viewH = 1
 	}
 
-	totalRows := len(pb.Variables) + varSectionCount(pb)
-	selectedRow := varIndexToDisplayRow(pb, state.SelectedVar)
+	totalRows := len(vars) + varSectionCount(vars)
+	selectedRow := varIndexToDisplayRow(vars, state.SelectedVar)
 	origin, _ := centeredScroll(selectedRow, totalRows, viewH)
 
 	nameW := 30
@@ -237,8 +307,8 @@ func renderVariables(g *gocui.Gui, state *AppState) {
 	displayRow := 0
 	rendered := 0
 	prevSource := ""
-	for i := 0; i < len(pb.Variables) && rendered < viewH; i++ {
-		vr := pb.Variables[i]
+	for i := 0; i < len(vars) && rendered < viewH; i++ {
+		vr := vars[i]
 
 		// Section header when source changes
 		if vr.Source != prevSource {
@@ -307,15 +377,30 @@ func renderCommand(g *gocui.Gui, state *AppState) {
 		return
 	}
 
-	cmd := generateCommand(pb)
+	cmd := generateCommand(pb, state.SelectedTags)
 	fmt.Fprint(v, cmd)
 }
 
 // generateCommand builds the ansible-playbook command string.
-func generateCommand(pb *Playbook) string {
+func generateCommand(pb *Playbook, selectedTags map[string]bool) string {
 	var b strings.Builder
 	b.WriteString("ansible-playbook ")
 	b.WriteString(pb.Path)
+
+	// Add --tags if any are selected
+	if len(selectedTags) > 0 {
+		var tags []string
+		allTags := pb.AllTags()
+		for _, t := range allTags {
+			if selectedTags[t] {
+				tags = append(tags, t)
+			}
+		}
+		if len(tags) > 0 {
+			b.WriteString(" \\\n  --tags ")
+			b.WriteString(strings.Join(tags, ","))
+		}
+	}
 
 	for _, v := range pb.Variables {
 		if v.UserValue == "" || v.IsComplex {
@@ -376,7 +461,7 @@ func keybindings(g *gocui.Gui, state *AppState) error {
 
 	// Global: Tab cycles panes
 	if err := g.SetKeybinding("", gocui.KeyTab, gocui.ModNone, func(g *gocui.Gui, v *gocui.View) error {
-		if state.EditMode {
+		if state.EditMode || state.TagPopupOpen {
 			return nil
 		}
 		state.ActivePane = (state.ActivePane + 1) % PaneCount
@@ -409,6 +494,20 @@ func keybindings(g *gocui.Gui, state *AppState) error {
 		{'q', quit},
 	} {
 		if err := g.SetKeybinding(viewPlaybooks, spec.key, gocui.ModNone, spec.fn); err != nil {
+			return err
+		}
+	}
+
+	// Tags pane: keybindings
+	for _, spec := range []struct {
+		key interface{}
+		fn  func(*gocui.Gui, *gocui.View) error
+	}{
+		{gocui.KeyEnter, openTagPopup(g, state)},
+		{'?', openHelp(g, state)},
+		{'q', quit},
+	} {
+		if err := g.SetKeybinding(viewTags, spec.key, gocui.ModNone, spec.fn); err != nil {
 			return err
 		}
 	}
@@ -464,6 +563,8 @@ func setFocus(g *gocui.Gui, state *AppState) error {
 	switch state.ActivePane {
 	case PanePlaybooks:
 		name = viewPlaybooks
+	case PaneTags:
+		name = viewTags
 	case PaneVariables:
 		name = viewVariables
 	case PaneCommand:
@@ -480,6 +581,7 @@ func pbUp(state *AppState) func(*gocui.Gui, *gocui.View) error {
 			state.SelectedPB--
 			state.SelectedVar = 0
 			state.VarScrollOffset = 0
+			state.SelectedTags = make(map[string]bool)
 		}
 		return nil
 	}
@@ -491,6 +593,7 @@ func pbDown(state *AppState) func(*gocui.Gui, *gocui.View) error {
 			state.SelectedPB++
 			state.SelectedVar = 0
 			state.VarScrollOffset = 0
+			state.SelectedTags = make(map[string]bool)
 		}
 		return nil
 	}
@@ -508,23 +611,39 @@ func varUp(state *AppState) func(*gocui.Gui, *gocui.View) error {
 
 func varDown(state *AppState) func(*gocui.Gui, *gocui.View) error {
 	return func(g *gocui.Gui, v *gocui.View) error {
-		pb := state.currentPlaybook()
-		if pb != nil && state.SelectedVar < len(pb.Variables)-1 {
+		vars := state.FilteredVariables()
+		if len(vars) > 0 && state.SelectedVar < len(vars)-1 {
 			state.SelectedVar++
 		}
 		return nil
 	}
 }
 
+// findOriginalVar finds the variable in pb.Variables that matches the
+// given filtered variable by name and source, returning a pointer to it.
+func findOriginalVar(pb *Playbook, name, source string) *Variable {
+	for i := range pb.Variables {
+		if pb.Variables[i].Name == name && pb.Variables[i].Source == source {
+			return &pb.Variables[i]
+		}
+	}
+	return nil
+}
+
 // openEditor creates an overlay view for editing a variable value.
 func openEditor(g *gocui.Gui, state *AppState) func(*gocui.Gui, *gocui.View) error {
 	return func(g *gocui.Gui, v *gocui.View) error {
 		pb := state.currentPlaybook()
-		if pb == nil || len(pb.Variables) == 0 {
+		if pb == nil {
 			return nil
 		}
-		vr := &pb.Variables[state.SelectedVar]
-		if vr.IsComplex {
+		vars := state.FilteredVariables()
+		if len(vars) == 0 || state.SelectedVar >= len(vars) {
+			return nil
+		}
+		filteredVar := vars[state.SelectedVar]
+		vr := findOriginalVar(pb, filteredVar.Name, filteredVar.Source)
+		if vr == nil || vr.IsComplex {
 			return nil
 		}
 
@@ -578,8 +697,14 @@ func confirmEdit(g *gocui.Gui, state *AppState) func(*gocui.Gui, *gocui.View) er
 		val := strings.TrimSpace(v.Buffer())
 
 		pb := state.currentPlaybook()
-		if pb != nil && state.SelectedVar < len(pb.Variables) {
-			pb.Variables[state.SelectedVar].UserValue = val
+		if pb != nil {
+			vars := state.FilteredVariables()
+			if state.SelectedVar < len(vars) {
+				fv := vars[state.SelectedVar]
+				if orig := findOriginalVar(pb, fv.Name, fv.Source); orig != nil {
+					orig.UserValue = val
+				}
+			}
 		}
 
 		return closeEditor(gui, state)
@@ -610,8 +735,15 @@ func closeEditor(g *gocui.Gui, state *AppState) error {
 func resetVar(state *AppState) func(*gocui.Gui, *gocui.View) error {
 	return func(g *gocui.Gui, v *gocui.View) error {
 		pb := state.currentPlaybook()
-		if pb != nil && state.SelectedVar < len(pb.Variables) {
-			pb.Variables[state.SelectedVar].UserValue = ""
+		if pb == nil {
+			return nil
+		}
+		vars := state.FilteredVariables()
+		if state.SelectedVar < len(vars) {
+			fv := vars[state.SelectedVar]
+			if orig := findOriginalVar(pb, fv.Name, fv.Source); orig != nil {
+				orig.UserValue = ""
+			}
 		}
 		return nil
 	}
@@ -625,7 +757,7 @@ func copyCommand(g *gocui.Gui, state *AppState) func(*gocui.Gui, *gocui.View) er
 			return nil
 		}
 
-		cmd := generateCommand(pb)
+		cmd := generateCommand(pb, state.SelectedTags)
 		if err := clipboard.WriteAll(cmd); err != nil {
 			state.Notification = fmt.Sprintf("Clipboard error: %v", err)
 		} else {
@@ -645,14 +777,6 @@ func copyCommand(g *gocui.Gui, state *AppState) func(*gocui.Gui, *gocui.View) er
 	}
 }
 
-// currentPlaybook returns the currently selected playbook.
-func (s *AppState) currentPlaybook() *Playbook {
-	if s.SelectedPB < 0 || s.SelectedPB >= len(s.Playbooks) {
-		return nil
-	}
-	return &s.Playbooks[s.SelectedPB]
-}
-
 // Page navigation for playbooks pane
 func pbPageUp(g *gocui.Gui, state *AppState) func(*gocui.Gui, *gocui.View) error {
 	return func(gui *gocui.Gui, v *gocui.View) error {
@@ -666,6 +790,7 @@ func pbPageUp(g *gocui.Gui, state *AppState) func(*gocui.Gui, *gocui.View) error
 		}
 		state.SelectedVar = 0
 		state.VarScrollOffset = 0
+		state.SelectedTags = make(map[string]bool)
 		return nil
 	}
 }
@@ -682,6 +807,7 @@ func pbPageDown(g *gocui.Gui, state *AppState) func(*gocui.Gui, *gocui.View) err
 		}
 		state.SelectedVar = 0
 		state.VarScrollOffset = 0
+		state.SelectedTags = make(map[string]bool)
 		return nil
 	}
 }
@@ -707,17 +833,210 @@ func varPageDown(g *gocui.Gui, state *AppState) func(*gocui.Gui, *gocui.View) er
 		if viewH <= 0 {
 			viewH = 1
 		}
-		pb := state.currentPlaybook()
-		if pb == nil {
+		vars := state.FilteredVariables()
+		if len(vars) == 0 {
 			return nil
 		}
 		state.SelectedVar += viewH
-		if state.SelectedVar >= len(pb.Variables) {
-			state.SelectedVar = len(pb.Variables) - 1
+		if state.SelectedVar >= len(vars) {
+			state.SelectedVar = len(vars) - 1
 		}
 		return nil
 	}
 }
+
+// --- Tag Popup Overlay ---
+
+// openTagPopup creates an overlay with a toggleable list of tags.
+func openTagPopup(g *gocui.Gui, state *AppState) func(*gocui.Gui, *gocui.View) error {
+	return func(gui *gocui.Gui, v *gocui.View) error {
+		pb := state.currentPlaybook()
+		if pb == nil || len(pb.AllTags()) == 0 {
+			return nil
+		}
+
+		state.TagPopupOpen = true
+		state.TagPopupCursor = 0
+
+		allTags := pb.AllTags()
+
+		maxX, maxY := gui.Size()
+		popupW := 50
+		if popupW > maxX-4 {
+			popupW = maxX - 4
+		}
+		popupH := len(allTags) + 1
+		if popupH > maxY-4 {
+			popupH = maxY - 4
+		}
+		x0 := (maxX - popupW) / 2
+		y0 := (maxY - popupH) / 2
+
+		tv, err := gui.SetView(viewTagPopup, x0, y0, x0+popupW, y0+popupH, 0)
+		if err != nil && !errors.Is(err, gocui.ErrUnknownView) {
+			return err
+		}
+
+		tv.Title = " Select Tags [Space: toggle, a: all, x: clear] "
+		tv.Frame = true
+		tv.FrameColor = gocui.ColorYellow
+
+		if _, err := gui.SetCurrentView(viewTagPopup); err != nil {
+			return err
+		}
+
+		renderTagPopup(gui, state)
+
+		// Keybindings for the popup
+		_ = gui.SetKeybinding(viewTagPopup, gocui.KeyArrowUp, gocui.ModNone, tagPopupUp(state))
+		_ = gui.SetKeybinding(viewTagPopup, gocui.KeyArrowDown, gocui.ModNone, tagPopupDown(state))
+		_ = gui.SetKeybinding(viewTagPopup, 'k', gocui.ModNone, tagPopupUp(state))
+		_ = gui.SetKeybinding(viewTagPopup, 'j', gocui.ModNone, tagPopupDown(state))
+		_ = gui.SetKeybinding(viewTagPopup, gocui.KeySpace, gocui.ModNone, tagPopupToggle(state))
+		_ = gui.SetKeybinding(viewTagPopup, gocui.KeyEnter, gocui.ModNone, tagPopupToggle(state))
+		_ = gui.SetKeybinding(viewTagPopup, gocui.KeyEsc, gocui.ModNone, closeTagPopup(gui, state))
+		_ = gui.SetKeybinding(viewTagPopup, 'q', gocui.ModNone, closeTagPopup(gui, state))
+		_ = gui.SetKeybinding(viewTagPopup, 'a', gocui.ModNone, tagPopupSelectAll(state))
+		_ = gui.SetKeybinding(viewTagPopup, 'x', gocui.ModNone, tagPopupClearAll(state))
+
+		return nil
+	}
+}
+
+// renderTagPopup draws the tag list with toggle checkboxes and role info.
+func renderTagPopup(g *gocui.Gui, state *AppState) {
+	v, err := g.View(viewTagPopup)
+	if err != nil {
+		return
+	}
+	v.Clear()
+
+	pb := state.currentPlaybook()
+	if pb == nil {
+		return
+	}
+
+	allTags := pb.AllTags()
+	for i, tag := range allTags {
+		cursor := "  "
+		if i == state.TagPopupCursor {
+			cursor = "> "
+		}
+		checkbox := "[ ]"
+		if state.SelectedTags[tag] {
+			checkbox = "[x]"
+		}
+		// Show which roles have this tag
+		var roles []string
+		for role, tags := range pb.RoleTags {
+			for _, t := range tags {
+				if t == tag {
+					roles = append(roles, role)
+					break
+				}
+			}
+		}
+		sort.Strings(roles)
+		roleInfo := strings.Join(roles, ", ")
+		fmt.Fprintf(v, "%s%s %s  \033[90m(%s)\033[0m\n", cursor, checkbox, tag, roleInfo)
+	}
+}
+
+func tagPopupUp(state *AppState) func(*gocui.Gui, *gocui.View) error {
+	return func(g *gocui.Gui, v *gocui.View) error {
+		if state.TagPopupCursor > 0 {
+			state.TagPopupCursor--
+		}
+		renderTagPopup(g, state)
+		return nil
+	}
+}
+
+func tagPopupDown(state *AppState) func(*gocui.Gui, *gocui.View) error {
+	return func(g *gocui.Gui, v *gocui.View) error {
+		pb := state.currentPlaybook()
+		if pb == nil {
+			return nil
+		}
+		allTags := pb.AllTags()
+		if state.TagPopupCursor < len(allTags)-1 {
+			state.TagPopupCursor++
+		}
+		renderTagPopup(g, state)
+		return nil
+	}
+}
+
+func tagPopupToggle(state *AppState) func(*gocui.Gui, *gocui.View) error {
+	return func(g *gocui.Gui, v *gocui.View) error {
+		pb := state.currentPlaybook()
+		if pb == nil {
+			return nil
+		}
+		allTags := pb.AllTags()
+		if state.TagPopupCursor >= len(allTags) {
+			return nil
+		}
+		tag := allTags[state.TagPopupCursor]
+		if state.SelectedTags[tag] {
+			delete(state.SelectedTags, tag)
+		} else {
+			if state.SelectedTags == nil {
+				state.SelectedTags = make(map[string]bool)
+			}
+			state.SelectedTags[tag] = true
+		}
+		// Reset variable selection since filtered list changes
+		state.SelectedVar = 0
+		state.VarScrollOffset = 0
+		renderTagPopup(g, state)
+		return nil
+	}
+}
+
+func tagPopupSelectAll(state *AppState) func(*gocui.Gui, *gocui.View) error {
+	return func(g *gocui.Gui, v *gocui.View) error {
+		pb := state.currentPlaybook()
+		if pb == nil {
+			return nil
+		}
+		if state.SelectedTags == nil {
+			state.SelectedTags = make(map[string]bool)
+		}
+		for _, t := range pb.AllTags() {
+			state.SelectedTags[t] = true
+		}
+		state.SelectedVar = 0
+		state.VarScrollOffset = 0
+		renderTagPopup(g, state)
+		return nil
+	}
+}
+
+func tagPopupClearAll(state *AppState) func(*gocui.Gui, *gocui.View) error {
+	return func(g *gocui.Gui, v *gocui.View) error {
+		state.SelectedTags = make(map[string]bool)
+		state.SelectedVar = 0
+		state.VarScrollOffset = 0
+		renderTagPopup(g, state)
+		return nil
+	}
+}
+
+func closeTagPopup(g *gocui.Gui, state *AppState) func(*gocui.Gui, *gocui.View) error {
+	return func(gui *gocui.Gui, v *gocui.View) error {
+		state.TagPopupOpen = false
+		gui.DeleteKeybindings(viewTagPopup)
+		if err := gui.DeleteView(viewTagPopup); err != nil {
+			return err
+		}
+		state.ActivePane = PaneTags
+		_, err := gui.SetCurrentView(viewTags)
+		return err
+	}
+}
+
+// --- Search ---
 
 // openSearch creates a vim-style "/" search overlay.
 func openSearch(g *gocui.Gui, state *AppState, pane int) func(*gocui.Gui, *gocui.View) error {
@@ -816,14 +1135,14 @@ func doSearch(state *AppState, direction int) {
 		}
 
 	case PaneVariables:
-		pb := state.currentPlaybook()
-		if pb == nil {
+		vars := state.FilteredVariables()
+		if len(vars) == 0 {
 			return
 		}
-		count := len(pb.Variables)
+		count := len(vars)
 		for i := 1; i <= count; i++ {
 			idx := (state.SelectedVar + i*direction + count) % count
-			v := pb.Variables[idx]
+			v := vars[idx]
 			target := strings.ToLower(v.Name + " " + v.Description + " " + v.Default)
 			if strings.Contains(target, query) {
 				state.SelectedVar = idx
@@ -854,7 +1173,7 @@ func openHelp(g *gocui.Gui, state *AppState) func(*gocui.Gui, *gocui.View) error
 	return func(gui *gocui.Gui, v *gocui.View) error {
 		maxX, maxY := gui.Size()
 		w := 56
-		h := 31
+		h := 42
 		if w > maxX-4 {
 			w = maxX - 4
 		}
@@ -881,7 +1200,7 @@ func openHelp(g *gocui.Gui, state *AppState) func(*gocui.Gui, *gocui.View) error
  └──────────────────────────────────────────────────┘
 
  GLOBAL
-   Tab          Cycle panes (playbooks/vars/cmd)
+   Tab          Cycle panes (playbooks/tags/vars/cmd)
    Ctrl+C       Quit
    q            Quit
    ?            Show this help
@@ -895,6 +1214,17 @@ func openHelp(g *gocui.Gui, state *AppState) func(*gocui.Gui, *gocui.View) error
    /            Search playbooks
    n            Next search match
    N            Previous search match
+
+ TAGS PANE
+   Enter        Open tag selector
+
+ TAG SELECTOR
+   j / Down     Next tag
+   k / Up       Previous tag
+   Space/Enter  Toggle tag on/off
+   a            Select all tags
+   x            Clear all tags
+   Escape/q     Close selector
 
  VARIABLES PANE
    j / Down     Next variable
